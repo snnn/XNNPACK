@@ -1,0 +1,29 @@
+# Copyright 2026 Google LLC
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("//:build_defs.bzl", "xnnpack_configurable_defines")
+
+config_setting(
+    name = "android_arm64",
+    values = {"cpu": "arm64-v8a"},
+)
+
+cc_binary(
+    name = "probe",
+    srcs = ["probe.cc"],
+    defines = xnnpack_configurable_defines(),
+    linkopts = ["-ldl"] + select({
+        ":android_arm64": ["-llog"],
+        "//conditions:default": [],
+    }),
+    linkstatic = True,
+    deps = [
+        "//:XNNPACK",
+        "//:operators",
+        "//:subgraph",
+        "@pthreadpool",
+    ],
+)

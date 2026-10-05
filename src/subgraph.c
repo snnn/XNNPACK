@@ -4414,6 +4414,42 @@ static bool is_qs8_to_f32_dequant(const struct xnn_subgraph* subgraph,
          out->datatype == xnn_datatype_fp32;
 }
 
+static bool should_fuse_bmm_dequantization(
+    size_t m, size_t k, size_t n, bool transpose_b,
+    const struct xnn_gemm_config* f32_gemm_config,
+    const struct xnn_gemm_config* qc8w_gemm_config) {
+  if (qc8w_gemm_config == NULL) {
+    return false;
+  }
+
+  // Rule 1: Always fuse for pure 1-token decode and folded decode (M <= 8).
+  // Preserves 4x memory bandwidth savings and prevents multi-megabyte cache
+  // thrashing.
+  if (m <= 8) {
+    return true;
+  }
+
+  // Rule 2: Hardware acceleration check (ARM SME1 / SME2).
+  // If the FP32 backend has a wide matrix-accumulator microkernel (e.g. MR >=
+  // 32), when M >= MR (M >= 32), the SME matrix tile is saturated and the
+  // 5x-9.5x compute gain of SME1/SME2 outweighs FP32 dequantization cost.
+  if (f32_gemm_config != NULL && f32_gemm_config->mr >= 32) {
+    return m < f32_gemm_config->mr;
+  }
+
+  // Rule 3: Layout and cache preservation on SIMD architectures (x86 AVX2 /
+  // NEON). Non-transposed matrices (transpose_b == false) incur expensive
+  // stride packing. Fusing INT8 dequantization avoids expanding non-contiguous
+  // weights into memory.
+  if (!transpose_b && n * k >= 1024 * 512) {
+    return true;
+  }
+
+  // Rule 4: For standard prefill chunks (M > 8 with transposed weights),
+  // opting out of fusion allows optimized packed FP32 GEMM kernels to run.
+  return false;
+}
+
 static bool rewrite_dequant_bmm_at(xnn_subgraph_t subgraph, uint32_t node_id) {
   // Only batch-matrix-multiply nodes are rewritten here. Check the node type
   // *before* reserving any space: reserving may reallocate the subgraph's node
@@ -4477,14 +4513,6 @@ static bool rewrite_dequant_bmm_at(xnn_subgraph_t subgraph, uint32_t node_id) {
     return false;
   }
 
-  const struct xnn_gemm_config* f32_qc8w_gemm_config =
-      xnn_init_f32_qc8w_gemm_config();
-  if (f32_qc8w_gemm_config == NULL ||
-      a_value->shape.dim[a_value->shape.num_dims - 2] >
-          f32_qc8w_gemm_config->mr) {
-    return false;
-  }
-
   // Determine channel info for b. For bmm, b is `[..., K, N]` (or `[..., N,
   // K]` if `XNN_FLAG_TRANSPOSE_B`). The N dimension is the qcint8 channel
   // dimension. The actual per-channel scale array is materialized by the
@@ -4494,7 +4522,22 @@ static bool rewrite_dequant_bmm_at(xnn_subgraph_t subgraph, uint32_t node_id) {
   const bool transpose_b = (node->flags & XNN_FLAG_TRANSPOSE_B) != 0;
   const size_t b_num_dims = b_qint8_value->shape.num_dims;
   const size_t channel_dim = transpose_b ? b_num_dims - 2 : b_num_dims - 1;
-  if (b_qint8_value->shape.dim[channel_dim] == 0) {
+  const size_t k_dim = transpose_b ? b_num_dims - 1 : b_num_dims - 2;
+  const size_t m = a_value->shape.dim[a_value->shape.num_dims - 2];
+  const size_t k = b_qint8_value->shape.dim[k_dim];
+  const size_t n = b_qint8_value->shape.dim[channel_dim];
+  if (n == 0) {
+    return false;
+  }
+
+  const struct xnn_gemm_config* f32_gemm_config = xnn_init_pf32_gemm_config();
+  if (f32_gemm_config == NULL) {
+    f32_gemm_config = xnn_init_f32_gemm_config(node->flags);
+  }
+  const struct xnn_gemm_config* f32_qc8w_gemm_config =
+      xnn_init_f32_qc8w_gemm_config();
+  if (!should_fuse_bmm_dequantization(m, k, n, transpose_b, f32_gemm_config,
+                                      f32_qc8w_gemm_config)) {
     return false;
   }
 

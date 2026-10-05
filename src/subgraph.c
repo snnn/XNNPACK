@@ -4418,36 +4418,60 @@ static bool should_fuse_bmm_dequantization(
     size_t m, size_t k, size_t n, bool transpose_b,
     const struct xnn_gemm_config* f32_gemm_config,
     const struct xnn_gemm_config* qc8w_gemm_config) {
-  if (qc8w_gemm_config == NULL) {
+  // The rewrite is chosen at graph optimization and is not revisited on
+  // reshape. Zero dimensions do not identify a decode workload.
+  if (qc8w_gemm_config == NULL || m == 0 || k == 0 || n == 0) {
     return false;
   }
 
-  // Rule 1: Always fuse for pure 1-token decode and folded decode (M <= 8).
-  // Preserves 4x memory bandwidth savings and prevents multi-megabyte cache
-  // thrashing.
-  if (m <= 8) {
-    return true;
-  }
-
-  // Rule 2: Hardware acceleration check (ARM SME1 / SME2).
-  // If the FP32 backend has a wide matrix-accumulator microkernel (e.g. MR >=
-  // 32), when M >= MR (M >= 32), the SME matrix tile is saturated and the
-  // 5x-9.5x compute gain of SME1/SME2 outweighs FP32 dequantization cost.
+  // Preserve the SME/SME2 cutoff: FP32 prefill can use the matrix tile once
+  // there are enough rows to fill it.
   if (f32_gemm_config != NULL && f32_gemm_config->mr >= 32) {
     return m < f32_gemm_config->mr;
   }
 
-  // Rule 3: Layout and cache preservation on SIMD architectures (x86 AVX2 /
-  // NEON). Non-transposed matrices (transpose_b == false) incur expensive
-  // stride packing. Fusing INT8 dequantization avoids expanding non-contiguous
-  // weights into memory.
-  if (!transpose_b && n * k >= 1024 * 512) {
+#if XNN_ARCH_X86 || XNN_ARCH_X86_64
+  // Match the selected AVX-512 kernel pair across CPU vendors. Ryzen 9950X
+  // measurements favor fusion, including prefill, for at least one full N tile.
+  // Keep the existing fallback for the unmeasured narrow-N region.
+  if (f32_gemm_config != NULL &&
+      f32_gemm_config->arch == xnn_arch_x86_avx512f &&
+      f32_gemm_config->mr == 7 && f32_gemm_config->nr == 32 &&
+      qc8w_gemm_config->arch == xnn_arch_x86_avx512skx &&
+      qc8w_gemm_config->mr == 7 && qc8w_gemm_config->nr == 32 &&
+      n >= qc8w_gemm_config->nr) {
     return true;
   }
 
-  // Rule 4: For standard prefill chunks (M > 8 with transposed weights),
-  // opting out of fusion allows optimized packed FP32 GEMM kernels to run.
-  return false;
+  if (f32_gemm_config != NULL && f32_gemm_config->arch == xnn_arch_x86_fma3 &&
+      f32_gemm_config->mr == 6 && f32_gemm_config->nr == 16 &&
+      qc8w_gemm_config->arch == xnn_arch_x86_avx2 &&
+      qc8w_gemm_config->mr == 5 && qc8w_gemm_config->nr == 16 && m <= 8 &&
+      !transpose_b && k >= 256 && n >= 256 &&
+      divide_round_up(m, qc8w_gemm_config->mr) <=
+          divide_round_up(m, f32_gemm_config->mr)) {
+    // Non-transposed M=7/8 benefits from cheaper INT8 RHS preparation with
+    // equal row-tile counts. Do not extend to M=6 or the transposed layout;
+    // small transposed tails can lose. K/N bounds delimit the initial scope.
+    return true;
+  }
+#else
+  (void)transpose_b;
+#endif
+
+  // Retain the previous small-operand policy on SIMD backends. In particular,
+  // small M=6/8 cases do not uniformly benefit from extending the MR cutoff.
+  if (m <= qc8w_gemm_config->mr) {
+    return true;
+  }
+
+  // Extend to folded decode only for a large individual RHS. The conservative
+  // 4 MiB INT8 bound matches the measured 512x8192 long-context workload;
+  // it is not an estimate of the crossover for smaller operands. Counting
+  // each RHS separately avoids treating many small batches as one large RHS.
+  size_t rhs_elements;
+  return m <= 8 && xnn_safe_mul(n, k, &rhs_elements) &&
+         rhs_elements >= 4 * 1024 * 1024;
 }
 
 static bool rewrite_dequant_bmm_at(xnn_subgraph_t subgraph, uint32_t node_id) {
@@ -4526,9 +4550,6 @@ static bool rewrite_dequant_bmm_at(xnn_subgraph_t subgraph, uint32_t node_id) {
   const size_t m = a_value->shape.dim[a_value->shape.num_dims - 2];
   const size_t k = b_qint8_value->shape.dim[k_dim];
   const size_t n = b_qint8_value->shape.dim[channel_dim];
-  if (n == 0) {
-    return false;
-  }
 
   const struct xnn_gemm_config* f32_gemm_config = xnn_init_pf32_gemm_config();
   if (f32_gemm_config == NULL) {
